@@ -1,0 +1,20 @@
+# __TELEGRAM_CHAT_ID__ and __TELEGRAM_API_URL__ get filled in from .env when the container starts
+route:
+  receiver: telegram
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: telegram
+    telegram_configs:
+      - bot_token_file: /run/secrets/telegram_bot_token
+        chat_id: __TELEGRAM_CHAT_ID__
+        api_url: __TELEGRAM_API_URL__
+        send_resolved: true
+        parse_mode: ""
+        # one line per alert: FIRING TargetDown main:5678: n8n does not answer
+        message: >-
+          {{ range .Alerts }}{{ if eq .Status "firing" }}FIRING{{ else }}RESOLVED{{ end }} {{ .Labels.alertname }}
+          {{- with .Labels.instance }} {{ . }}{{ end }}: {{ .Annotations.summary }}{{ "\n" }}{{ end }}

@@ -1,0 +1,19 @@
+{
+	skip_install_trust
+}
+
+# a public name gets a Let's Encrypt cert (needs ports 80 and 443 open), localhost gets one from
+# Caddy's own CA, root is /data/caddy/pki/authorities/local/root.crt
+{$SITE_ADDRESS} {
+	# n8n serves it without auth, Prometheus scrapes it inside the compose network
+	handle /metrics* {
+		respond 404
+	}
+	@live path /webhook/* /webhook-waiting/* /form/* /form-waiting/* /mcp/*
+	handle @live {
+		reverse_proxy webhook:5678
+	}
+	handle {
+		reverse_proxy main:5678
+	}
+}

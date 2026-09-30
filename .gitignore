@@ -1,0 +1,7 @@
+__pycache__/
+# n8nctl state, what was last pushed to each instance
+.n8nctl/
+# written by tools/setup.py and by a restore, never commit these
+.env
+secrets/
+restored/

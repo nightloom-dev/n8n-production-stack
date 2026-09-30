@@ -1,0 +1,58 @@
+groups:
+  - name: n8n
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        annotations:
+          summary: "{{ $labels.job }} does not answer"
+
+      - alert: QueueBacklog
+        expr: n8n_scaling_mode_queue_jobs_waiting > 20
+        for: 5m
+        annotations:
+          summary: "{{ $value }} executions have been waiting for a worker for 5 minutes: add workers or concurrency"
+
+      # from the db (prometheus/postgres-queries.yml), n8n's own metrics don't count what a dead worker lost
+      # a lost execution isn't rerun and its input is gone. the numbers vanish while Postgres restarts,
+      # keep_firing_for stops that from looking like a resolve
+      - alert: ExecutionsLost
+        expr: n8n_executions_lost > 0
+        keep_firing_for: 2m
+        annotations:
+          summary: "{{ $value }} executions in the last 15 minutes were lost by a worker that died, and will not run again"
+
+      - alert: ExecutionErrors
+        expr: n8n_executions_failed >= 5 and n8n_executions_failed / n8n_executions_finished > 0.1
+        keep_firing_for: 2m
+        annotations:
+          summary: "{{ $value }} executions failed in the last 15 minutes, over 10% of all"
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        annotations:
+          summary: Postgres does not answer
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        annotations:
+          summary: Redis does not answer, so no executions start
+
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.1
+        for: 10m
+        annotations:
+          summary: "Less than 10% disk space left on {{ $labels.mountpoint }}"
+
+      - alert: BackupFailed
+        expr: n8n_backup_last_run_success == 0
+        annotations:
+          summary: "The last backup failed: docker compose logs backup"
+
+      - alert: BackupMissing
+        expr: time() - n8n_backup_last_success_timestamp_seconds > 26 * 3600 or absent(n8n_backup_last_success_timestamp_seconds)
+        for: 1h
+        annotations:
+          summary: No successful backup for over a day

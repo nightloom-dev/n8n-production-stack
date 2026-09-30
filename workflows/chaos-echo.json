@@ -1,0 +1,81 @@
+{
+  "active": true,
+  "connections": {
+    "JavaScript": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Python",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "POST /webhook/chaos/echo": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "JavaScript",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "id": "ChaosEchoFlow001",
+  "name": "chaos echo",
+  "nodes": [
+    {
+      "id": "2db91d73-f5fa-58cc-b9d1-b03de33cac2e",
+      "name": "POST /webhook/chaos/echo",
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {},
+        "path": "chaos/echo",
+        "responseMode": "lastNode"
+      },
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "webhookId": "c5749f89-c7c6-5490-8294-62f7a314a325"
+    },
+    {
+      "id": "804e4acb-b840-5597-a39e-d159462fd994",
+      "name": "JavaScript",
+      "parameters": {
+        "jsCode": "// sleep_ms keeps the execution running long enough for a restart or a kill to catch it\nconst crypto = require('crypto');\nconst { id, sleep_ms = 0 } = $input.first().json.body;\nawait new Promise(resolve => setTimeout(resolve, sleep_ms));\nconst js = crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 12);\nreturn [{ json: { id, js, version: 1 } }];"
+      },
+      "position": [
+        220,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "af54002a-0af3-5126-9b34-c4dff9f29ab1",
+      "name": "Python",
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "item = _items[0][\"json\"]\nreturn [{\"json\": {**item, \"py\": str(item[\"id\"])[::-1]}}]"
+      },
+      "position": [
+        440,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "chaos"
+  ]
+}

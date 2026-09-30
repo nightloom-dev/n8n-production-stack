@@ -1,0 +1,280 @@
+name: n8n
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: 10m, max-file: "3"}
+
+x-n8n: &n8n
+  image: &n8n-image n8nio/n8n:2.40.7  # keep n8nio/runners below on the same version
+  restart: unless-stopped
+  logging: *logging
+  stop_grace_period: 45s  # n8n waits up to 30 s for running executions, docker's default 10 s would cut them off
+  secrets: [postgres_password, n8n_encryption_key, runners_auth_token]
+  environment:
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_USER: n8n
+    DB_POSTGRESDB_PASSWORD_FILE: /run/secrets/postgres_password
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: redis
+    OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"  # main runs nothing itself, so no runner for it
+    N8N_ENCRYPTION_KEY_FILE: /run/secrets/n8n_encryption_key
+    N8N_RUNNERS_MODE: external
+    N8N_RUNNERS_AUTH_TOKEN_FILE: /run/secrets/runners_auth_token
+    N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+    N8N_WEBHOOK_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}/
+    N8N_EDITOR_BASE_URL: ${PUBLIC_URL}/
+    N8N_PROXY_HOPS: "1"
+    N8N_METRICS: "true"
+    N8N_METRICS_INCLUDE_QUEUE_METRICS: "true"
+    QUEUE_HEALTH_CHECK_ACTIVE: "true"  # workers don't serve /healthz without this
+    N8N_PUBLIC_API_SWAGGERUI_DISABLED: "true"
+    N8N_DIAGNOSTICS_ENABLED: "false"
+    N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+    # n8n nags to set these explicitly. its new stricter defaults, except Code nodes keep 5 min
+    N8N_UNVERIFIED_PACKAGES_ENABLED: "false"
+    N8N_COMPRESSION_NODE_MAX_DECOMPRESSED_SIZE_BYTES: "268435456"
+    N8N_COMPRESSION_NODE_MAX_ZIP_ENTRIES: "1000"
+    N8N_RUNNERS_TASK_TIMEOUT: "300"
+    GENERIC_TIMEZONE: ${TZ:-UTC}
+    TZ: ${TZ:-UTC}
+  healthcheck:
+    test: [CMD, node, -e, "fetch('http://127.0.0.1:5678/healthz/readiness').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 2m
+  depends_on:
+    main: {condition: service_healthy}
+
+x-runners: &runners
+  image: n8nio/runners:2.40.7
+  restart: unless-stopped
+  logging: *logging
+  secrets: [runners_auth_token]
+
+x-runners-env: &runners-env
+  N8N_RUNNERS_AUTH_TOKEN_FILE: /run/secrets/runners_auth_token
+  GENERIC_TIMEZONE: ${TZ:-UTC}
+
+x-postgres-health: &postgres-health
+  test: [CMD, pg_isready, -U, n8n, -d, n8n]
+  interval: 5s
+  timeout: 5s
+  retries: 10
+
+x-backup: &backup
+  image: n8n-backup:local
+  logging: *logging
+  secrets: [postgres_password, n8n_encryption_key, restic_password]
+  environment: &backup-env
+    PGHOST: postgres
+    PGUSER: n8n
+    PGDATABASE: n8n
+    RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:-/repo}
+    RESTIC_PASSWORD_FILE: /run/secrets/restic_password
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    BACKUP_AT: ${BACKUP_AT:-03:00}
+    PUSHGATEWAY: http://pushgateway:9091
+    TZ: ${TZ:-UTC}
+
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    restart: unless-stopped
+    logging: *logging
+    stop_grace_period: 30s
+    secrets: [postgres_password]
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck: *postgres-health
+
+  redis:
+    image: redis:7.4.11-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: [redis-server, --appendonly, "yes"]  # so queued executions survive a restart
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD-SHELL, redis-cli ping | grep -q PONG]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # UI, API, schedules and other triggers, test webhooks
+  main:
+    <<: *n8n
+    volumes: [n8n-data:/home/node/.n8n]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  # production webhooks and forms, keep working while main restarts
+  webhook:
+    <<: *n8n
+    command: [webhook]
+
+  # these run the executions, each worker has its own Code node runners
+  worker-1:
+    <<: *n8n
+    command: [worker, "--concurrency=${WORKER_CONCURRENCY:-10}"]
+  runners-1:
+    <<: *runners
+    environment: {<<: *runners-env, N8N_RUNNERS_TASK_BROKER_URI: http://worker-1:5679}
+    depends_on: [worker-1]
+
+  worker-2:
+    <<: *n8n
+    command: [worker, "--concurrency=${WORKER_CONCURRENCY:-10}"]
+  runners-2:
+    <<: *runners
+    environment: {<<: *runners-env, N8N_RUNNERS_TASK_BROKER_URI: http://worker-2:5679}
+    depends_on: [worker-2]
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    logging: *logging
+    ports: ["${HTTP_PUBLISH:-80}:80", "${HTTPS_PUBLISH:-443}:443"]
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddy-data:/data, caddy-config:/config]
+
+  backup:
+    <<: *backup
+    build: backup
+    restart: unless-stopped
+    command: [schedule]
+    volumes: [backup-repo:/repo]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    logging: *logging
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus,
+              --storage.tsdb.retention.time=30d]
+    ports: ["${PROMETHEUS_PUBLISH:-127.0.0.1:9090}:9090"]
+    volumes: [./prometheus:/etc/prometheus:ro, prometheus-data:/prometheus]
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    restart: unless-stopped
+    logging: *logging
+    # alertmanager config has no env expansion, so chat id and API URL are put in at start
+    entrypoint: [/bin/sh, -c]
+    command: ['sed -e "s|__TELEGRAM_CHAT_ID__|$$TELEGRAM_CHAT_ID|" -e "s|__TELEGRAM_API_URL__|$$TELEGRAM_API_URL|"
+               /etc/alertmanager/alertmanager.yml > /tmp/alertmanager.yml &&
+               exec /bin/alertmanager --config.file=/tmp/alertmanager.yml --storage.path=/alertmanager']
+    environment:
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:--1}
+      TELEGRAM_API_URL: ${TELEGRAM_API_URL:-https://api.telegram.org}
+    secrets: [telegram_bot_token]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["${ALERTMANAGER_PUBLISH:-127.0.0.1:9093}:9093"]
+    volumes: [./alertmanager:/etc/alertmanager:ro, alertmanager-data:/alertmanager]
+
+  pushgateway:
+    image: prom/pushgateway:v1.11.3
+    restart: unless-stopped
+    logging: *logging
+    command: [--persistence.file=/pushgateway/metrics]
+    volumes: [pushgateway-data:/pushgateway]
+
+  grafana:
+    image: grafana/grafana:12.4.11
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    secrets: [grafana_admin_password]
+    ports: ["${GRAFANA_PUBLISH:-127.0.0.1:3000}:3000"]
+    volumes: [./grafana/provisioning:/etc/grafana/provisioning:ro, ./grafana/dashboards:/etc/grafana/dashboards:ro,
+              grafana-data:/var/lib/grafana]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      DATA_SOURCE_URI: postgres:5432/n8n?sslmode=disable
+      DATA_SOURCE_USER: n8n
+      DATA_SOURCE_PASS_FILE: /run/secrets/postgres_password
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    secrets: [postgres_password]
+    volumes: [./prometheus/postgres-queries.yml:/etc/postgres-exporter/queries.yml:ro]
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.92.0
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_ADDR: redis://redis:6379
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    restart: unless-stopped
+    logging: *logging
+    command: [--path.rootfs=/host]
+    volumes: ["/:/host:ro,rslave"]
+
+  # restore drill (tools/chaos.py restore): latest backup goes into a scratch db, then n8n reads it
+  # only starts with --profile drill
+  drill-postgres:
+    image: postgres:17.11-alpine
+    profiles: [drill]
+    secrets: [postgres_password]
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck: *postgres-health
+  drill-restore:
+    <<: *backup
+    profiles: [drill]
+    command: [restore]
+    environment: {<<: *backup-env, PGHOST: drill-postgres}
+    volumes: [backup-repo:/repo, drill-key:/restore]
+    depends_on:
+      drill-postgres: {condition: service_healthy}
+  drill-n8n:
+    image: *n8n-image
+    profiles: [drill]
+    secrets: [postgres_password]
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: drill-postgres
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD_FILE: /run/secrets/postgres_password
+      N8N_ENCRYPTION_KEY_FILE: /restore/n8n_encryption_key
+    volumes: [drill-key:/restore:ro]
+    depends_on:
+      drill-restore: {condition: service_completed_successfully}
+
+secrets:
+  postgres_password: {file: secrets/postgres_password}
+  n8n_encryption_key: {file: secrets/n8n_encryption_key}
+  runners_auth_token: {file: secrets/runners_auth_token}
+  restic_password: {file: secrets/restic_password}
+  grafana_admin_password: {file: secrets/grafana_admin_password}
+  telegram_bot_token: {file: secrets/telegram_bot_token}
+
+volumes:
+  postgres-data:
+  redis-data:
+  n8n-data:
+  caddy-data:
+  caddy-config:
+  backup-repo:
+  prometheus-data:
+  alertmanager-data:
+  pushgateway-data:
+  grafana-data:
+  drill-key:

@@ -1,0 +1,21 @@
+# extra metrics postgres-exporter reads from n8n's db. n8n's own metrics miss executions lost by a killed
+# worker, those end up in the db as error (or crashed) with a message that they won't be retried
+n8n_executions:
+  query: |
+    SELECT count(*) AS finished,
+           count(*) FILTER (WHERE e.status IN ('error', 'crashed')) AS failed,
+           count(*) FILTER (WHERE e.status = 'crashed'
+                            OR d.data LIKE '%failed to be processed too many times%') AS lost
+    FROM execution_entity e
+    LEFT JOIN execution_data d ON d."executionId" = e.id AND e.status = 'error'
+    WHERE e."stoppedAt" > now() - interval '15 minutes'
+  metrics:
+    - finished:
+        usage: GAUGE
+        description: Executions that finished in the last 15 minutes
+    - failed:
+        usage: GAUGE
+        description: Of those, how many failed or crashed
+    - lost:
+        usage: GAUGE
+        description: Of those, how many were lost by a worker that died while running them
