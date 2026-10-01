@@ -195,6 +195,20 @@ in `compose.yml` as `worker-3` and `runners-3`, and add `worker-3:5678` to `prom
 - **Grafana, Prometheus and Alertmanager** are reached through an SSH tunnel. There is no single sign-on in front
   of them.
 
+## Commercial support & migration
+
+This stack is built and maintained by [Nightloom Development](https://nightloom-dev.com). We take paid work around it:
+
+- **Install on your server:** DNS and TLS, Telegram alerts, offsite backups, and a restore drill before it goes live.
+- **Migration:** from n8n Cloud, a default one-process install or another host. Workflows, credentials and webhook URLs move over, and the switch happens at a time you pick.
+- **n8n upgrades:** a backup first, the new version tried on a restored copy, then the switch.
+- **Monitoring and backups:** alerts and dashboards for your own workflows, more workers when the queue grows, help when an alert fires.
+- **Fixes:** lost executions, a queue that keeps growing, a full disk, a backup that stopped.
+
+The first piece of work is fixed-price, so you can judge it before the rest. After that it's $30/h. We reply within one business day. We don't sell uptime guarantees: this is one machine, see [Limits](#limits).
+
+Email unwinned@nightloom-dev.com with your current setup and what you want to change.
+
 ## Files
 
 ```
@@ -210,3 +224,7 @@ tools/chaos.py            the chaos run above
 workflows/chaos-echo.json the test workflow, in n8nctl's portable format
 n8nctl.py                 pull, diff, push, rollback and credentials between n8n instances
 ```
+
+## License
+
+MIT
