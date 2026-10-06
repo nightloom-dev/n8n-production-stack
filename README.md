@@ -8,6 +8,27 @@ The default install is one process: the editor, the webhooks, the schedules and 
 workflow delays the webhooks, a restart drops requests, and the first sign of trouble is a client asking why
 nothing happened. This setup splits those jobs apart, watches each of them, and was tested by breaking them.
 
+- **Webhooks keep being answered** while the editor process restarts, is upgraded or is down.
+- **Executions run on two workers**, 10 at a time each, and a deploy or a worker restart costs no requests.
+- **Code nodes run in separate containers** that have no access to the database password or the encryption key.
+- **Every failure that matters reaches Telegram**: a process down, a lost execution, a growing queue, a full disk,
+  a failed or missing backup.
+- **Backups are tested every night** by restoring them, and a full restore drill is part of the test run.
+
+## Contents
+
+- [Proof](#proof)
+- [How it works](#how-it-works): [processes](#processes), [a request end to end](#a-request-end-to-end),
+  [crashes](#crashes), [secrets and TLS](#secrets-and-tls), [monitoring](#monitoring), [backups](#backups),
+  [restore drill](#restore-drill), [deploys](#deploys)
+- [Run it](#run-it)
+- [Configuration](#configuration)
+- [Going live](#going-live)
+- [Operations](#operations)
+- [Limits](#limits)
+- [Commercial support & migration](#commercial-support--migration)
+- [Files](#files)
+
 ## Proof
 
 `tools/chaos.py` sends requests through Caddy to a test workflow: a webhook, a JavaScript Code node and a Python
@@ -29,25 +50,23 @@ that records them. One full run on a laptop (8 cores, 11 GB, a desktop session r
 | Restore drill | backup in 10.3 s, restore into an empty Postgres and read in 18.4 s. The restored workflows and decrypted credentials match the live ones by hash |
 
 So a restart that is part of normal work (a worker, `main`, a deploy) costs no requests. A crash or a restart of
-Redis or Postgres does cost some, and the sender has to send again: the limits below say what else it costs.
+Redis or Postgres does cost some, and the sender has to send again: the [limits](#limits) say what else it costs.
+
+**Why one test workflow.** The stack is the product here, and it runs whatever workflows you put on it. The test
+workflow, `workflows/chaos-echo.json`, is built to touch every hop a real execution takes: the webhook process, the
+queue, a worker, the JavaScript runner and the Python runner. It answers with values computed from the request, so
+a wrong or stale answer is caught, not only a missing one. Its optional `sleep_ms` keeps executions running long
+enough for a kill to land in the middle of them. For real workflows that run on n8n like this, see the
+[Stripe → Xero sync](https://github.com/nightloom-dev/n8n-stripe-xero).
 
 ## How it works
 
-```mermaid
-flowchart LR
-  callers((callers)) --> caddy["Caddy<br>TLS"]
-  caddy -- "/webhook/*, /form/*" --> webhook["webhook<br>production webhooks"]
-  caddy -- "editor, API" --> main["main<br>editor, API, schedules"]
-  webhook & main -- executions --> redis[("Redis<br>queue")]
-  redis --> worker1["worker-1"] & worker2["worker-2"]
-  worker1 <--> runners1["runners-1<br>JavaScript, Python"]
-  worker2 <--> runners2["runners-2<br>JavaScript, Python"]
-  main & webhook & worker1 & worker2 --> postgres[("Postgres")]
-  postgres --> backup["backup<br>nightly, restored to check"] --> restic[("restic<br>volume or S3")]
-  prometheus["Prometheus"] -. scrapes .-> main & webhook & worker1 & worker2
-  prometheus --> alertmanager["Alertmanager"] --> telegram[Telegram]
-  grafana["Grafana"] --> prometheus
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+  <img alt="Callers reach Caddy, Caddy sends webhooks to the webhook process and everything else to main, both put executions on the Redis queue, worker-1 and worker-2 run them with their own runners, and every process keeps its state in Postgres" src="docs/architecture-light.png">
+</picture>
+
+### Processes
 
 **Three kinds of n8n process.** `main` serves the editor and the API and fires schedules and the other triggers.
 `webhook` answers production webhooks and forms: Caddy sends `/webhook/*` and `/form/*` there, so requests keep
@@ -57,32 +76,146 @@ the workers too, so a heavy test does not slow the editor down.
 
 **Code nodes in their own containers.** Each worker hands its Code nodes to a runners container (`n8nio/runners`,
 the same version) over a token-authenticated connection. Code there cannot read the worker's files or environment:
-the database password and the encryption key the credentials depend on are not in that container.
-
-**Crashes.** A worker that is stopped (a deploy, `docker compose restart`) takes no new executions and finishes
-the running ones, for up to 30 seconds; `stop_grace_period` gives it that time. A worker that is killed (out of
-memory, SIGKILL) loses the executions it was running. About a minute later, when their lock in Redis runs out, n8n
-marks them failed and answers each waiting webhook caller with a 500. It does not run them again, and their input is
-gone, so the Retry button in Executions does nothing for them. A sender that retries, as Stripe does, gets its
-request through on the next try. The restart policy brings the worker back, and the `ExecutionsLost` alert reports
-every loss.
+the database password and the encryption key the credentials depend on are not in that container. A Code node gets
+5 minutes (`N8N_RUNNERS_TASK_TIMEOUT`).
 
 **Queue.** Redis writes the queue to disk every second (AOF), so queued executions survive a Redis restart.
 Binary data (files the workflows handle) goes into Postgres, which is n8n's default in queue mode: every process
 can read it, and the backups include it.
 
-**Secrets.** `tools/setup.py` generates them into `secrets/` (mode 700, never committed). They reach the
-containers as Docker secrets and are read from files (`*_FILE` variables), so `docker inspect` does not show them.
+The 17 services and what each one is for:
+
+| Service | Image | Does | Reachable at | Health check |
+|---|---|---|---|---|
+| `caddy` | `caddy:2.11.4-alpine` | TLS, routes webhooks to `webhook`, the rest to `main` | `HTTPS_PUBLISH`, `HTTP_PUBLISH` | |
+| `main` | `n8nio/n8n:2.40.7` | editor, API, schedules and other triggers, database migrations | through Caddy | `/healthz/readiness`, every 10 s |
+| `webhook` | `n8nio/n8n:2.40.7` | production webhooks and forms | through Caddy | same |
+| `worker-1`, `worker-2` | `n8nio/n8n:2.40.7` | run executions, `WORKER_CONCURRENCY` each | internal | same |
+| `runners-1`, `runners-2` | `n8nio/runners:2.40.7` | JavaScript and Python Code nodes of one worker | internal | |
+| `postgres` | `postgres:17.11-alpine` | workflows, credentials, executions, binary data | internal | `pg_isready`, every 5 s |
+| `redis` | `redis:7.4.11-alpine` | the execution queue, AOF on | internal | `PING`, every 5 s |
+| `backup` | built from `backup/` | nightly dump, test restore, restic, metrics | internal | |
+| `prometheus` | `prom/prometheus:v3.15.0` | scrapes every 15 s, keeps 30 days, evaluates the alert rules | `127.0.0.1:9090` | |
+| `alertmanager` | `prom/alertmanager:v0.34.1` | groups alerts and sends them to Telegram | `127.0.0.1:9093` | |
+| `pushgateway` | `prom/pushgateway:v1.11.3` | keeps the backup results for Prometheus | internal | |
+| `grafana` | `grafana/grafana:12.4.11` | the dashboard | `127.0.0.1:3000` | |
+| `postgres-exporter` | `prometheuscommunity/postgres-exporter:v0.20.1` | Postgres metrics, and failed and lost executions from n8n's tables | internal | |
+| `redis-exporter` | `oliver006/redis_exporter:v1.92.0` | Redis metrics | internal | |
+| `node-exporter` | `prom/node-exporter:v1.12.1` | CPU, memory and disk of the host | internal | |
+
+`webhook` and the workers start only after `main` is healthy, because `main` runs the database migrations. Each
+n8n process gets 45 seconds to stop (`stop_grace_period`), since n8n waits up to 30 seconds for running executions.
+Every service logs to Docker's json-file driver, 3 files of 10 MB. Three more services (`drill-postgres`,
+`drill-restore`, `drill-n8n`) exist only under `--profile drill`, for the [restore drill](#restore-drill).
+
+### A request end to end
+
+```mermaid
+sequenceDiagram
+  participant C as Caller
+  participant Ca as Caddy
+  participant W as webhook
+  participant R as Redis
+  participant K as worker
+  participant RN as runners
+  participant DB as Postgres
+  C->>Ca: POST /webhook/chaos/echo (HTTPS)
+  Ca->>W: /webhook/* goes to the webhook process
+  W->>DB: create the execution
+  W->>R: put it on the queue
+  R->>K: whichever worker has a free slot
+  K->>DB: load the workflow and the input
+  K->>RN: JavaScript Code node
+  RN-->>K: result
+  K->>RN: Python Code node
+  RN-->>K: result
+  K->>DB: save the result
+  K->>R: execution finished
+  R-->>W: execution finished
+  W->>DB: read the result
+  W-->>C: 200 and the last node's output
+```
+
+Each hop is a place where something can fail, and the [chaos run](#proof) breaks them one at a time. The `main`
+process is not on this path at all, which is why stopping it costs no webhooks.
+
+### Crashes
+
+A worker that is stopped (a deploy, `docker compose restart`) takes no new executions and finishes the running
+ones, for up to 30 seconds; `stop_grace_period` gives it that time. A worker that is killed (out of memory,
+SIGKILL) loses the executions it was running:
+
+```mermaid
+sequenceDiagram
+  participant C as Sender
+  participant W as webhook
+  participant R as Redis
+  participant K1 as worker-1
+  participant K2 as worker-2
+  participant T as Telegram
+  C->>W: request
+  W->>R: execution queued
+  R->>K1: running
+  Note over K1: SIGKILL, 5 executions were running
+  Note over K1: restart policy brings it back after 27 s
+  Note over R: the execution's lock in Redis runs out
+  R-->>W: marked failed (failed to be processed too many times)
+  W-->>C: 500, up to 88 s after the request
+  C->>W: same request, 5 s later
+  W->>R: new execution
+  R->>K2: runs normally
+  K2->>R: execution finished
+  W-->>C: 200
+  Note over T: ExecutionsLost, 70 s after the kill
+```
+
+n8n does not run a lost execution again, and its input is gone, so the Retry button in Executions does nothing for
+it. A sender that retries, as Stripe does, gets its request through on the next try. The restart policy brings the
+worker back, and the `ExecutionsLost` alert reports every loss.
+
+### Secrets and TLS
+
+`tools/setup.py` generates the secrets into `secrets/` (mode 700, never committed). They reach the containers as
+Docker secrets and are read from files (`*_FILE` variables), so `docker inspect` does not show them, and each
+container gets only the ones it needs:
+
+| File | Used by |
+|---|---|
+| `postgres_password` | Postgres, the n8n processes, the backup, postgres-exporter |
+| `n8n_encryption_key` | the n8n processes (it encrypts the stored credentials), the backup |
+| `runners_auth_token` | the n8n processes and the runners, so only they can talk to each other |
+| `restic_password` | the backup. Without it the backups cannot be read |
+| `grafana_admin_password` | Grafana |
+| `telegram_bot_token` | Alertmanager. `setup.py` writes a placeholder, put the real token there |
+| `owner_password` | written by `setup.py`: the n8n owner's login |
+
 The one exception is the S3 keys for offsite backups, which live in `.env` (mode 600).
 
-**TLS.** Caddy gets a Let's Encrypt certificate for a public `SITE_ADDRESS`. For `localhost` it uses its own
-certificate authority, and `setup.py` gives its root certificate to n8nctl, so no tool runs with verification
-off. n8n's `/metrics` endpoint is not served to the outside.
+Caddy gets a Let's Encrypt certificate for a public `SITE_ADDRESS`. For `localhost` it uses its own certificate
+authority, and `setup.py` gives its root certificate to n8nctl, so no tool runs with verification off. It routes
+by path:
 
-**Monitoring.** Every 15 seconds Prometheus scrapes each n8n process, Postgres, Redis, the host and the backup
-results, and it keeps 30 days. n8n's own metrics miss the executions a dead worker lost, so failed and lost
-executions are counted in the database instead (`prometheus/postgres-queries.yml`). The alert rules go through
-Alertmanager to Telegram, one line per alert, and one more line when it resolves:
+| Path | Goes to |
+|---|---|
+| `/webhook/*`, `/webhook-waiting/*`, `/form/*`, `/form-waiting/*`, `/mcp/*` | `webhook` |
+| `/metrics*` | 404: n8n serves metrics without auth, Prometheus reads them inside the Docker network |
+| everything else | `main` |
+
+### Monitoring
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/monitoring-dark.png">
+  <img alt="Prometheus scrapes the n8n processes, the exporters and the Pushgateway, Grafana reads Prometheus, alerts go through Alertmanager to Telegram, and the backup writes its results to the Pushgateway and its data to the restic repository" src="docs/monitoring-light.png">
+</picture>
+
+Every 15 seconds Prometheus scrapes each n8n process, Postgres, Redis, the host and the backup results, and it
+keeps 30 days. The alert rules go through Alertmanager to Telegram, one line per alert, and one more line when it
+resolves:
+
+```
+FIRING TargetDown main:5678: n8n does not answer
+RESOLVED TargetDown main:5678: n8n does not answer
+```
 
 | Alert | Fires when |
 |---|---|
@@ -95,24 +228,96 @@ Alertmanager to Telegram, one line per alert, and one more line when it resolves
 | `BackupFailed` | the last backup failed |
 | `BackupMissing` | no backup has succeeded for 26 hours |
 
-Grafana opens on a provisioned dashboard. It shows executions per minute by outcome, p50 and p95 run time, the
-queue, event-loop lag, memory and CPU per process, database size and connections, Redis memory, free disk and the
-age of the last backup.
+Alertmanager groups alerts by name, waits 30 seconds before the first message so a burst becomes one message, and
+repeats an alert that is still firing every 4 hours.
 
-**Backups.** Every night at `BACKUP_AT` the backup container dumps the database and takes the encryption key along:
-without the key, the credentials in the dump cannot be decrypted. Before the backup counts, the dump is restored
-into a scratch Postgres inside the container, and its workflows and credentials are counted against the live
-database. Then restic stores it, encrypted and deduplicated, in a volume on this machine or offsite in S3. It keeps
-7 daily, 4 weekly and 6 monthly snapshots, and every Sunday it reads back 10% of the stored data. Each run reports
-to the Pushgateway, so a failed or missing backup becomes an alert.
+**Lost executions are counted in the database.** n8n's own metrics miss the executions a dead worker lost, so
+`prometheus/postgres-queries.yml` gives postgres-exporter one more query. It counts, over the last 15 minutes, the
+executions that finished, the ones that failed or crashed, and the ones lost by a worker, which n8n marks with
+"failed to be processed too many times". `ExecutionsLost` and `ExecutionErrors` keep firing for 2 minutes after
+these numbers disappear, so a Postgres restart, when the exporter cannot read them, does not look like a resolve.
 
-**Restore drill.** Only a restore proves a backup. The last step of `chaos.py` restores the latest snapshot the
-way a real recovery would: `backup.sh restore` into an empty Postgres. Then it starts n8n there with the restored
-key, and compares the workflows and the decrypted credentials with the live instance, by hash.
+**Grafana** opens on a provisioned dashboard: n8n processes down, executions waiting for a worker, running, failed
+and lost in the last 15 minutes, age of the last backup; then executions per minute by outcome, p50 and p95 run
+time, the queue, event-loop lag, memory and CPU per process, database size and connections, Redis memory, free disk
+and the scrape targets.
 
-**Deploys.** Workflows move between instances with `n8nctl.py`, the same tool the
-[Stripe → Xero sync](https://github.com/nightloom-dev/n8n-stripe-xero) uses. It can show the `diff` against git,
-`push` a release, and `rollback` to the one before. `chaos.py` pushes a new version under load and rolls it back.
+### Backups
+
+Every night at `BACKUP_AT` (time zone `TZ`) the backup container runs `backup.sh run`:
+
+```mermaid
+flowchart TD
+  start(["BACKUP_AT, every day"]) --> dump["pg_dump, uncompressed so restic can deduplicate,<br>plus the encryption key"]
+  dump --> verify["restore the dump into a scratch Postgres<br>inside the container"]
+  verify --> counts{"workflows and credentials<br>match the live database?"}
+  counts -- yes --> restic["restic backup<br>encrypted, deduplicated"]
+  restic --> forget["forget and prune<br>keep 7 daily, 4 weekly, 6 monthly"]
+  forget --> sunday{"Sunday?"}
+  sunday -- yes --> check["restic check<br>reads back 10% of the data"]
+  check --> ok
+  sunday -- no --> ok["success, time, duration and dump size<br>to the Pushgateway"]
+  counts -- no --> fail["failure to the Pushgateway<br>BackupFailed in Telegram"]
+```
+
+The key goes with the dump because without it the credentials in the dump cannot be decrypted. Executions keep
+coming in while the dump runs, so only workflows and credentials have to match exactly. Any step that fails, not
+only the count, reports a failure. If the nightly run did not happen at all (the server was off), `BackupMissing`
+fires after 26 hours. The restic repository is a Docker volume on this machine by default, or S3 offsite
+(`RESTIC_REPOSITORY`).
+
+### Restore drill
+
+Only a restore proves a backup. The last step of `chaos.py` restores the latest snapshot the way a real recovery
+would, into containers that exist only for the drill:
+
+```mermaid
+flowchart LR
+  repo[("restic repository")] --> restore["drill-restore<br>backup.sh restore latest"]
+  restore --> pg[("drill-postgres<br>empty, in memory")]
+  restore --> key["restored encryption key"]
+  pg & key --> n8n["drill-n8n"]
+  n8n --> compare{"same workflows and<br>decrypted credentials<br>as live, by hash?"}
+```
+
+`backup.sh restore` refuses to run against a database that already holds n8n, so a slip cannot overwrite the live
+one.
+
+### Deploys
+
+Workflows move between instances with `n8nctl.py`, the same tool the
+[Stripe → Xero sync](https://github.com/nightloom-dev/n8n-stripe-xero) uses. Workflows live in git as JSON with
+credential names instead of ids, so the same files go to any instance.
+
+```sh
+python3 n8nctl.py pull     local workflows            # instance into files
+python3 n8nctl.py diff     local workflows            # what a push would change
+python3 n8nctl.py push     local workflows -m "why"   # files into the instance
+python3 n8nctl.py rollback local workflows            # undo the last push
+```
+
+```mermaid
+sequenceDiagram
+  participant G as workflows/ in git
+  participant N as n8nctl push
+  participant P as target n8n
+  N->>G: read the files
+  N->>P: read the live workflows and credentials
+  N->>N: compare with the versions of the last push
+  alt someone edited the target since the last push
+    N-->>G: refuse, pull that edit first (or --force)
+  else
+    N->>N: credential names and sub-workflow refs to the target's ids
+    N->>P: save drafts, then publish, callees before callers
+    alt a step fails
+      N->>P: put the previous versions back
+    end
+    N->>N: remember the previous versions for rollback
+  end
+```
+
+Each publish is named after the git commit (`n8nctl 1a2b3c4`, `+dirty` with uncommitted changes), so the version history in n8n says what was
+deployed. `chaos.py` pushes a new version under load and rolls it back, and no request fails.
 
 ## Run it
 
@@ -128,6 +333,40 @@ python3 tools/chaos.py       # about 30 minutes, ends with "chaos: OK"
 `secrets/owner_password` and Grafana's in `secrets/grafana_admin_password`. Grafana (`:3000`), Prometheus (`:9090`)
 and Alertmanager (`:9093`) listen on 127.0.0.1 only; on a server, reach them through an SSH tunnel. `setup.py` is
 safe to run again: it keeps the secrets, the owner and a working key.
+
+`chaos.py --only worker-kill restore` runs only the scenarios named:
+
+| Scenario | What it does |
+|---|---|
+| `baseline` | no faults: one request at a time, then 20 at once |
+| `worker-restart` | restarts worker-1, which finishes its work while worker-2 takes the rest |
+| `worker-kill` | SIGKILL to worker-1's n8n, then waits for `ExecutionsLost` in Telegram |
+| `main-down` | stops `main` for 2 minutes, then waits for `TargetDown` and its resolve |
+| `redis-restart` | restarts Redis under load, failed requests are sent again |
+| `postgres-restart` | the same for Postgres |
+| `deploy` | pushes a new version of the test workflow with n8nctl under load, then rolls it back |
+| `restore` | takes a fresh backup and runs the [restore drill](#restore-drill) |
+
+Alerts that were already firing when the run started, such as a full disk, are ignored, and Alertmanager is
+pointed back at the real Telegram at the end.
+
+## Configuration
+
+Everything that differs between machines is in `.env`, copied from `.env.example` on the first `setup.py`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SITE_ADDRESS` | `localhost` | the name Caddy gets a certificate for |
+| `PUBLIC_URL` | `https://localhost:8443` | the address n8n puts into webhook URLs and links |
+| `HTTPS_PUBLISH`, `HTTP_PUBLISH` | `127.0.0.1:8443`, `127.0.0.1:8080` | where Caddy listens. `443` and `80` on a server |
+| `GRAFANA_PUBLISH`, `PROMETHEUS_PUBLISH`, `ALERTMANAGER_PUBLISH` | `127.0.0.1:3000`, `:9090`, `:9093` | kept on this machine, use an SSH tunnel |
+| `TZ` | `UTC` | time zone of schedules and of `BACKUP_AT` |
+| `WORKER_CONCURRENCY` | `10` | executions each worker runs at once |
+| `BACKUP_AT` | `03:00` | time of the nightly backup |
+| `RESTIC_REPOSITORY` | `/repo` (a volume) | where backups go, `s3:https://<endpoint>/<bucket>/n8n` for offsite |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | empty | S3 keys for an offsite repository |
+| `TELEGRAM_CHAT_ID` | `-1` | the chat alerts go to. Until it and the bot token are real, Alertmanager logs why it cannot send |
+| `TELEGRAM_API_URL` | `https://api.telegram.org` | `chaos.py` points it at its stand-in for the run |
 
 ## Going live
 
@@ -171,6 +410,19 @@ in `compose.yml` as `worker-3` and `runners-3`, and add `worker-3:5678` to `prom
 
 **Test the alerts.** `docker compose exec alertmanager amtool alert add Test summary="test from amtool"
 --alertmanager.url=http://localhost:9093` sends a message to the Telegram chat within 30 seconds.
+
+**Change the alert rules.** Edit `prometheus/alerts.yml` and reload Prometheus with
+`docker compose exec prometheus kill -HUP 1`. `docker compose kill -s HUP prometheus` sends the same signal but
+marks the container as stopped by hand, so it would not come back after a reboot.
+
+**Everyday commands.**
+
+```sh
+docker compose ps                              # every service and its health
+docker compose logs -f --since 10m worker-1    # one service's log
+docker compose exec backup backup.sh run       # a backup now
+docker compose exec backup restic snapshots    # what is in the repository
+```
 
 ## Limits
 
@@ -216,13 +468,14 @@ compose.yml               the stack: n8n processes, runners, Postgres, Redis, Ca
 Caddyfile                 TLS, and which paths go to the webhook process
 .env.example              addresses, ports, backup schedule and target, Telegram chat
 backup/                   the backup image: pg_dump, a check restore, restic, metrics
-prometheus/               scrape targets and alert rules
+prometheus/               scrape targets, alert rules, the executions query for postgres-exporter
 alertmanager/             Telegram delivery
 grafana/                  data source and dashboard, provisioned
 tools/setup.py            first start: secrets, stack, n8n owner, n8nctl key, first backup
 tools/chaos.py            the chaos run above
 workflows/chaos-echo.json the test workflow, in n8nctl's portable format
 n8nctl.py                 pull, diff, push, rollback and credentials between n8n instances
+docs/                     the diagrams in this README
 ```
 
 ## License
