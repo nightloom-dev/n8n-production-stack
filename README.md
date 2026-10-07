@@ -15,6 +15,8 @@ nothing happened. This setup splits those jobs apart, watches each of them, and 
   a failed or missing backup.
 - **Backups are tested every night** by restoring them, and a full restore drill is part of the test run.
 
+*Developed in a private repository and published here as a snapshot, so the history starts at publication.*
+
 ## Contents
 
 - [Proof](#proof)
